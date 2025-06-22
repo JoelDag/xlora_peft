@@ -360,35 +360,19 @@ class PeftModelWrapper:
         self,
         save_directory: str,
         safe_serialization: bool = True,
-        selected_adapters: Optional[List[str]] = None,
+        selected_adapters: Optional[list[str]] = None,
         save_embedding_layers: Union[str, bool] = "auto",
         is_main_process: bool = True,
-        **kwargs: Any,
+        **kwargs,
     ) -> None:
-        r"""
-        This function saves the classifier weights to a directory. It is the counerpart to `from_pretrained`.
+        import os, json, warnings, torch
+        from safetensors.torch import load_file, save_file
 
-        Args:
-            save_directory (`str`):
-                Directory where the adapter model and configuration files will be saved. This can be either:
-                    - A local directory (will be created if it does not exist)
-                    - An HF Hub model ID
-            safe_serialization (`bool`, *optional*):
-                Whether to save the adapter files in safetensors format, defaults to `True`.
-            is_main_process (`bool`, *optional*):
-                Whether the process calling this is the main process or not. Will default to `True`. Will not save the
-                checkpoint if not on the main process, which is important for multi device setups (e.g. DDP).
-        """
         if os.path.isfile(save_directory):
-            raise ValueError(f"Provided path ({save_directory}) should be a directory, not a file")
+            raise ValueError(f"{save_directory} is a file – expected a directory")
 
         if is_main_process:
             os.makedirs(save_directory, exist_ok=True)
-
-        classifier: xLoRAClassifier = self.model.internal_xlora_classifier  # type: ignore
-
-        conf = classifier.config.__dict__.copy()
-        del conf["device"]
 
         self.base_model_save(
             save_directory=save_directory,
@@ -399,14 +383,50 @@ class PeftModelWrapper:
             **kwargs,
         )
 
-        conf["adapters"] = list(conf["adapters"].keys())
-        with open(os.path.join(save_directory, "xlora_config.json"), "w") as f:
-            json.dump(conf, f)
+        # Pick the existing adapter file
+        sts_file = os.path.join(save_directory, "adapter_model.safetensors")
+        bin_file = os.path.join(save_directory, "adapter_model.bin")
 
-        if safe_serialization:
-            # https://github.com/huggingface/peft/blob/main/src/peft/peft_model.py#L223
-            if is_main_process and safe_serialization:
-                save_model(classifier, os.path.join(save_directory, "xlora_classifier.safetensors"))
-        elif is_main_process:
-            state_dict = classifier.state_dict()
-            torch.save(state_dict, os.path.join(save_directory, "xlora_classifier.pt"))
+        if os.path.exists(sts_file):
+            adapter_path, using_safe = sts_file, True
+        elif os.path.exists(bin_file):
+            adapter_path, using_safe = bin_file, False
+        else:
+            warnings.warn("No adapter_model file produced – nothing to strip.")
+            adapter_path, using_safe = None, safe_serialization
+
+        #strip classifier params, include only relevant layers
+        if is_main_process and adapter_path is not None:
+            if using_safe:
+                sd = load_file(adapter_path)
+            else:
+                sd = torch.load(adapter_path, map_location="cpu")
+
+            sd = {k: v for k, v in sd.items()
+                if not k.startswith("internal_xlora_classifier")}
+
+            if using_safe:
+                save_file(sd, adapter_path)
+            else:
+                torch.save(sd, adapter_path)
+
+        classifier = self.model.internal_xlora_classifier
+        cfg = classifier.config.__dict__.copy()
+        cfg.pop("device", None)
+        cfg["adapters"] = list(cfg["adapters"].keys())
+
+        if is_main_process:
+            with open(os.path.join(save_directory, "xlora_config.json"), "w") as f:
+                json.dump(cfg, f)
+
+        if is_main_process:
+            if safe_serialization:
+                save_file(
+                    classifier.state_dict(),
+                    os.path.join(save_directory, "xlora_classifier.safetensors"),
+                )
+            else:
+                torch.save(
+                    classifier.state_dict(),
+                    os.path.join(save_directory, "xlora_classifier.pt"),
+                )
